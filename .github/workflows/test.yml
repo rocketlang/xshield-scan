@@ -1,0 +1,68 @@
+name: Test xShield Action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run daily at 06:00 UTC to catch regressions
+    - cron: '0 6 * * *'
+
+jobs:
+  test-pass:
+    name: Should pass (low-risk domain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan low-risk domain (expect pass)
+        id: scan
+        uses: ./
+        with:
+          domain: 'example.com'
+          api-key: ${{ secrets.XSHIELD_API_KEY }}
+          fail-threshold: '95'   # very high threshold so it passes
+
+      - name: Print outputs
+        run: |
+          echo "Score : ${{ steps.scan.outputs.risk-score }}"
+          echo "Level : ${{ steps.scan.outputs.risk-level }}"
+          echo "Report: ${{ steps.scan.outputs.report-url }}"
+
+  test-output-types:
+    name: Outputs are set correctly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run scan
+        id: scan
+        uses: ./
+        with:
+          domain: 'xshieldai.com'
+          api-key: ${{ secrets.XSHIELD_API_KEY }}
+          fail-threshold: '100'  # never fail
+
+      - name: Validate outputs
+        run: |
+          SCORE="${{ steps.scan.outputs.risk-score }}"
+          LEVEL="${{ steps.scan.outputs.risk-level }}"
+          URL="${{ steps.scan.outputs.report-url }}"
+
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]]; then
+            echo "::error::risk-score is not a number: $SCORE"
+            exit 1
+          fi
+
+          if [ -z "$LEVEL" ]; then
+            echo "::error::risk-level is empty"
+            exit 1
+          fi
+
+          if [ -z "$URL" ]; then
+            echo "::error::report-url is empty"
+            exit 1
+          fi
+
+          echo "✅ All outputs valid — score=$SCORE level=$LEVEL"

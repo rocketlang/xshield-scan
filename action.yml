@@ -1,0 +1,167 @@
+name: 'xShield Domain Risk Scan'
+description: >
+  Scan a domain for digital risks using xShield AI — IP threats, breach monitoring,
+  typosquats, phishing detection, DNS security, and more. Fails CI if the risk score
+  exceeds your configured threshold.
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  domain:
+    description: 'Domain to scan (e.g. example.com)'
+    required: true
+  api-key:
+    description: 'Your xShield API key (xsh_live_...)'
+    required: true
+  fail-threshold:
+    description: 'Fail the job if risk score exceeds this value (0–100). Default: 70'
+    required: false
+    default: '70'
+  api-url:
+    description: 'xShield API base URL (override for self-hosted instances)'
+    required: false
+    default: 'https://xshieldai.com/api'
+
+outputs:
+  risk-score:
+    description: 'Numeric risk score (0–100)'
+    value: ${{ steps.scan.outputs.risk-score }}
+  risk-level:
+    description: 'Risk level: MINIMAL | LOW | MEDIUM | HIGH | CRITICAL'
+    value: ${{ steps.scan.outputs.risk-level }}
+  report-url:
+    description: 'URL to the full risk report'
+    value: ${{ steps.scan.outputs.report-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run xShield risk scan
+      id: scan
+      shell: bash
+      env:
+        XSHIELD_DOMAIN: ${{ inputs.domain }}
+        XSHIELD_API_KEY: ${{ inputs.api-key }}
+        XSHIELD_THRESHOLD: ${{ inputs.fail-threshold }}
+        XSHIELD_BASE_URL: ${{ inputs.api-url }}
+      run: |
+        set -eo pipefail
+
+        DOMAIN="$XSHIELD_DOMAIN"
+        API_KEY="$XSHIELD_API_KEY"
+        THRESHOLD="$XSHIELD_THRESHOLD"
+        BASE_URL="$XSHIELD_BASE_URL"
+        REPORT_URL="$BASE_URL/risk/report?domain=$DOMAIN"
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  🛡️  xShield Domain Risk Scan"
+        echo "  Domain    : $DOMAIN"
+        echo "  Threshold : $THRESHOLD / 100"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # ── Call the API ──────────────────────────────────────────────
+        HTTP_STATUS=$(curl -s -o /tmp/xshield_response.json -w "%{http_code}" \
+          -H "Authorization: Bearer $API_KEY" \
+          -H "Accept: application/json" \
+          "$BASE_URL/risk/score?domain=$DOMAIN")
+
+        if [ "$HTTP_STATUS" -eq 401 ]; then
+          echo "::error::Invalid API key — check your XSHIELD_API_KEY secret."
+          exit 1
+        fi
+
+        if [ "$HTTP_STATUS" -eq 429 ]; then
+          echo "::error::Rate limit exceeded. Upgrade your plan at https://xshieldai.com/pricing"
+          exit 1
+        fi
+
+        if [ "$HTTP_STATUS" -ne 200 ]; then
+          echo "::error::xShield API returned HTTP $HTTP_STATUS. Response:"
+          cat /tmp/xshield_response.json
+          exit 1
+        fi
+
+        # ── Parse JSON with Python (always available on GitHub runners) ──
+        SCORE=$(python3 - <<'PYEOF'
+import json, sys
+with open('/tmp/xshield_response.json') as f:
+    d = json.load(f)
+print(int(d.get('score', d.get('riskScore', 0))))
+PYEOF
+        )
+
+        LEVEL=$(python3 - <<'PYEOF'
+import json
+with open('/tmp/xshield_response.json') as f:
+    d = json.load(f)
+score = int(d.get('score', d.get('riskScore', 0)))
+explicit = d.get('level', d.get('riskLevel', ''))
+if explicit:
+    print(explicit.upper())
+elif score <= 14:
+    print('MINIMAL')
+elif score <= 34:
+    print('LOW')
+elif score <= 54:
+    print('MEDIUM')
+elif score <= 74:
+    print('HIGH')
+else:
+    print('CRITICAL')
+PYEOF
+        )
+
+        # ── Set outputs ───────────────────────────────────────────────
+        echo "risk-score=$SCORE"  >> "$GITHUB_OUTPUT"
+        echo "risk-level=$LEVEL"  >> "$GITHUB_OUTPUT"
+        echo "report-url=$REPORT_URL" >> "$GITHUB_OUTPUT"
+
+        # ── Pick badge colour for summary ─────────────────────────────
+        if   [ "$SCORE" -le 14 ]; then BADGE="🟢"
+        elif [ "$SCORE" -le 34 ]; then BADGE="🟡"
+        elif [ "$SCORE" -le 54 ]; then BADGE="🟠"
+        elif [ "$SCORE" -le 74 ]; then BADGE="🔴"
+        else BADGE="🚨"; fi
+
+        # ── GitHub Step Summary ───────────────────────────────────────
+        cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+
+## $BADGE xShield Risk Scan — \`$DOMAIN\`
+
+| Property | Value |
+|----------|-------|
+| **Risk Score** | **$SCORE** / 100 |
+| **Risk Level** | $LEVEL |
+| **Threshold** | $THRESHOLD |
+| **Full Report** | [View →]($REPORT_URL) |
+
+SUMMARY
+
+        echo ""
+        echo "  Score     : $SCORE / 100"
+        echo "  Level     : $LEVEL"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        # ── Threshold check ───────────────────────────────────────────
+        if [ "$SCORE" -gt "$THRESHOLD" ]; then
+          echo "::error::❌ Risk score $SCORE exceeds threshold $THRESHOLD for $DOMAIN"
+          echo "::error::View full report: $REPORT_URL"
+          cat >> "$GITHUB_STEP_SUMMARY" << FAIL
+
+> ❌ **FAILED** — Risk score **$SCORE** exceeds threshold **$THRESHOLD**.
+> Resolve the findings listed in the [full report]($REPORT_URL) before merging.
+
+FAIL
+          exit 1
+        else
+          echo "  ✅ Risk score $SCORE is within threshold $THRESHOLD"
+          cat >> "$GITHUB_STEP_SUMMARY" << PASS
+
+> ✅ **PASSED** — Risk score **$SCORE** is within the threshold of **$THRESHOLD**.
+
+PASS
+        fi
